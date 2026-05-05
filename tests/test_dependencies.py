@@ -126,16 +126,22 @@ class TestGetReadyExtractor:
         mock_ctx = MagicMock()
         mock_ctx.report_progress = AsyncMock()
 
-        with patch(
-            "instagram_mcp_server.tools.user.handle_auth_error",
-            new_callable=AsyncMock,
-            side_effect=AuthenticationStartedError("login opened"),
-        ) as mock_handle:
+        with (
+            patch(
+                "instagram_mcp_server.tools.user.get_ready_extractor",
+                new_callable=AsyncMock,
+                return_value=mock_extractor,
+            ),
+            patch(
+                "instagram_mcp_server.tools.user.handle_auth_error",
+                new_callable=AsyncMock,
+                side_effect=AuthenticationStartedError("login opened"),
+            ) as mock_handle,
+        ):
             with pytest.raises(ToolError, match="login opened"):
                 await tools["get_user_profile"](
                     username="testuser",
                     ctx=mock_ctx,
-                    extractor=mock_extractor,
                 )
 
             mock_handle.assert_awaited_once()

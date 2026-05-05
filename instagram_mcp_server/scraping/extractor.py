@@ -1078,7 +1078,7 @@ class InstagramExtractor:
                 // Filter out extension-injected anchors (e.g. download helpers)
                 if (a.href.startsWith('chrome-extension:') || a.href.startsWith('moz-extension:')) return null;
                 const href = a.href;
-                const match = href.match(/\/reel\/([A-Za-z0-9_-]+)/);
+                const match = href.match(/\\/reel\\/([A-Za-z0-9_-]+)/);
                 const reelId = match ? match[1] : '';
                 // Get view count from nearby text or aria-label
                 const parent = a.closest('article, div');
@@ -1128,7 +1128,7 @@ class InstagramExtractor:
                 if (a.href.startsWith('chrome-extension:') || a.href.startsWith('moz-extension:')) continue;
 
                 const href = a.href || '';
-                const match = href.match(/\/reel\/([A-Za-z0-9_-]+)/);
+                const match = href.match(/\\/reel\\/([A-Za-z0-9_-]+)/);
                 const reelId = match ? match[1] : '';
 
                 // Get thumbnail from multiple strategies (Instagram lazy-loads images)
@@ -1152,7 +1152,7 @@ class InstagramExtractor:
                         if (urlInner.startsWith('"') || urlInner.startsWith("'")) {
                             urlInner = urlInner.substring(1);
                         }
-                        const endIdx = urlInner.search(/["')\s]/);
+                        const endIdx = urlInner.search(/["')\\s]/);
                         const url = endIdx !== -1 ? urlInner.substring(0, endIdx) : urlInner;
                         if (url.includes('instagram')) thumbnail = url;
                     }
@@ -1264,7 +1264,7 @@ class InstagramExtractor:
                 const href = a.href || '';
                 const isReel = href.includes('/reel/');
                 const type = isReel ? 'reel' : 'post';
-                const idMatch = href.match(/\/(p|reel)\/([A-Za-z0-9_-]+)/);
+                const idMatch = href.match(/\\/(p|reel)\\/([A-Za-z0-9_-]+)/);
                 const shortcode = idMatch ? idMatch[2] : '';
 
                 // Get thumbnail: prefer largest CDN image, skip extension icons
@@ -1464,7 +1464,7 @@ class InstagramExtractor:
             post_links = await self._extract_post_links(max_posts)
 
             # Filter references to only include posts (not reels) for consistency
-            post_only_links = [ref for ref in post_links if ref.kind == "post"]
+            post_only_links = [ref for ref in post_links if ref["kind"] == "post"]
 
             # Extract text section for backward compatibility
             raw_result = await self._extract_root_content(["main"])
@@ -1524,7 +1524,7 @@ class InstagramExtractor:
                 // Skip extension-injected anchors
                 if (a.href.startsWith('chrome-extension:') || a.href.startsWith('moz-extension:')) return null;
                 const href = a.href;
-                const match = href.match(/\/(p|reel)\/([A-Za-z0-9_-]+)/);
+                const match = href.match(/\\/(p|reel)\\/([A-Za-z0-9_-]+)/);
                 const postId = match ? match[2] : '';
                 const type = href.includes('/reel/') ? 'reel' : 'post';
                 return {{

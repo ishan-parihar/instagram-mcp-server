@@ -1,5 +1,8 @@
 """Test Brave CDP connection module."""
 
+import sys
+from unittest.mock import patch
+
 import pytest
 from instagram_mcp_server.drivers.brave_cdp import (
     find_brave_process,
@@ -56,5 +59,7 @@ class TestConnectToBrave:
         """Should raise CDPConnectionError when Brave is not running."""
         from instagram_mcp_server.exceptions import CDPConnectionError
 
-        with pytest.raises(CDPConnectionError):
-            await connect_to_brave()
+        # Use port=1 to avoid interference from other browsers (e.g. obscura) on port 9222
+        with patch.object(sys, "argv", ["pytest"]):
+            with pytest.raises(CDPConnectionError):
+                await connect_to_brave(port=1)
