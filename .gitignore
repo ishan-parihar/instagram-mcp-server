@@ -214,3 +214,6 @@ scripts/snapshot_dumps/
 .hive/
 .memsearch/
 .sisyphus/
+.contexty/
+.hive/
+.memsearch/
