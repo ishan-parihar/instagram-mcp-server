@@ -8,257 +8,224 @@
   <img src="https://img.shields.io/badge/Python-3.12+-blue" alt="Python Version">
 </p>
 
-Model Context Protocol server that lets AI assistants (Claude, Cursor, Windsurf, etc.) interact with Instagram. Access profiles, posts, reels, Business/Creator insights, direct messages, and account actions with zero UX interference.
+**The Problem**: Instagram has no official public API for profile scraping, insights, or messaging. AI assistants (`Claude`, `Cursor`, `Windsurf`) need structured Instagram data — profiles, posts, reels, DMs, business insights — but Instagram's front end is a moving target. Hashed CSS classes change weekly. Rate limits and auth barriers are aggressive. A naive `selenium` script breaks within days.
+
+**What this is**: A purpose-built MCP server that treats Instagram's web client as an *adversarial data source*. It uses a custom browser orchestration engine that survives DOM churn, manages browser sessions across three runtime modes (legacy, CDP, Docker), and serializes tool execution to prevent Instagram's session state from corrupting.
+
+**Engineering highlights**: innerText-based extraction (zero DOM selector dependence), state-machine driven bootstrap with background retries, sequential tool middleware to prevent concurrent navigation conflicts, and a rich error diagnostic system that maps 15+ Instagram failure modes to actionable messages.
+
+---
+
+## The Problem
+
+Instagram's web app is engineered *against* automation:
+
+- **No public API** for profiles, reels, DMs, or business insights. Everything must go through the web client.
+- **Hashed CSS classes** (`x1n2onr6`, `x1lliihq`, etc.) change with every deploy. Any scraper relying on DOM selectors breaks within weeks.
+- **Concurrent page states** interfere. If two tools navigate Instagram simultaneously (e.g., "fetch profile" and "send DM"), the session enters an inconsistent state and Instagram forces re-authentication.
+- **Rate limits and auth barriers** are invisible — no HTTP status code. They appear as in-page "blocked" overlays, requiring DOM-level detection.
+- **Session persistence** across restarts requires cookie extraction from browser-native SQLite stores, which differ by browser (Chrome, Firefox, Brave, Edge, etc.).
+
+Existing solutions (Puppeteer wrappers, static scrapers) fail because they couple extraction logic to ephemeral layout details, or lack the state management needed for multi-tool AI workflows.
+
+---
+
+## Engineering Highlights
+
+### 1. DOM-Agnostic Extraction Engine
+
+**Anti-pattern**: Most scrapers use CSS selectors like `div.x1n2onr6 > span._aacl`. When Instagram rotates these classes, the scraper silently returns empty data.
+
+**Solution**: The extractor (`scraping/extractor.py`) relies on **`innerText` and URL navigation**, not DOM selectors. Each "section" (`posts`, `reels`, `followers`) maps to exactly one page navigation (`USER_SECTIONS` dict). Extraction reads visible text, then strips Instagram's chrome (footer links, sidebar noise) using regex markers:
+
+```python
+# Noise markers strip Instagram chrome instead of brittle CSS selectors
+_NOISE_MARKERS = [
+    re.compile(r"^About\n+(?:Help|Press|API|Jobs|Terms|Privacy)", re.MULTILINE),
+    re.compile(r"^© \d{4} Instagram from Meta$", re.MULTILINE),
+    re.compile(r"^Suggested for you$", re.MULTILINE),
+]
+```
+
+This approach survives layout changes because Instagram cannot hide text content from the user without breaking its own UX — and `innerText` reads exactly what a human sees.
+
+**Key constraint**: "One section = one navigation." Each section triggers exactly one `page.goto()`. Combining multiple data sources into a single navigation creates coupling that breaks when Instagram reorganized pages.
+
+### 2. Three-Mode Browser Architecture
+
+The server supports three distinct runtime policies, each solving a different operational constraint:
+
+| Mode | Entry | Cookie Source | Use Case |
+|------|-------|--------------|----------|
+| **Legacy** | Default | SQLite cookie store detection | Desktop AI clients |
+| **CDP** | `--cdp` flag | Live Brave browser session | Users who don't want cookie extraction |
+| **Docker** | `Dockerfile` | Pre-exported portable auth (`tar` archive) | Server/headless deployments |
+
+The **CDP bridge** (`drivers/browser._bridge_runtime_profile()`) is the most architecturally interesting: it connects to a running Brave browser via Chrome DevTools Protocol, imports cookies from the persistent source session into an ephemeral runtime profile, and isolates scraping in a separate browser context — zero interference with the user's actual browsing.
+
+The **Docker runtime** solves the "headless auth" problem: Instagram's anti-bot checks detect missing GPU/display. The solution creates an authenticated profile on the host via `--login`, then `tar` archives it for injection into the container. The container never handles login — just cookie replay.
+
+### 3. Sequential Tool Execution Middleware
+
+Instagram's web app is a single-page application with mutable global state. If two MCP tool calls navigate Instagram simultaneously, the following happens:
+
+1. Tool A navigates to `instagram.com/natgeo/posts/`
+2. Tool B navigates to `instagram.com/direct/inbox/`
+3. Instagram's SPA state corrupts — neither tool gets valid data
+4. Instagram detects the "impossible" navigation pattern and forces re-login
+
+**Solution**: An `asyncio.Lock`-based middleware (`SequentialToolExecutionMiddleware`) serializes all MCP tool calls within the same server process. Each tool waits in a queue, acquires the lock, executes, and releases:
+
+```python
+class SequentialToolExecutionMiddleware(Middleware):
+    async def on_call_tool(self, context, call_next):
+        async with self._lock:  # Only one navigation at a time
+            return await call_next(context)
+```
+
+This is a middleware registered at server creation, not per-tool — zero tool implementation changes.
+
+### 4. Bootstrap & Authentication State Machine
+
+The bootstrap system (`bootstrap.py`) manages a complex initialization lifecycle across process restarts:
+
+```
+IDLE → SETUP_IN_PROGRESS → READY
+           ↓ (failed)
+         FAILED → (background retry) → SETUP_IN_PROGRESS
+```
+
+The auth state machine runs independently:
+
+```
+UNKNOWN → CHECKING → READY
+   ↓ (expired)          ↓ (expired)
+INVALID → RELOGIN_IN_PROGRESS → READY
+```
+
+Key design decisions:
+- **Background-first browser setup**: `patchright` Chromium downloads in a background task, not at startup. Tools become available immediately; if the browser isn't ready, they raise `BrowserSetupInProgressError` with a "retry in a few minutes" message.
+- **Cookie bridge, not credential store**: No Instagram passwords are stored. Auth state is purely cookie-based, extracted from the host browser's SQLite store.
+- **Auto-relogin on expiry**: When Instagram invalidates a session mid-flight, the system detects it via `detect_auth_barrier()` and triggers a fresh login flow — no manual intervention.
+
+### 5. Rich Error Diagnostics
+
+A naive scraper returns HTTP 200 with a "login required" page, and the AI client has no way to understand what happened.
+
+**Solution**: A centralized `raise_tool_error()` function maps 15+ Instagram-specific exception types to user-friendly `ToolError` messages with **auto-generated diagnostics**:
+
+```python
+except AuthenticationError:
+    raise ToolError(
+        "Authentication failed. Run with --login to re-authenticate."
+    ) from exception
+except RateLimitError:
+    raise ToolError(
+        f"Rate limit detected. Wait {exception.suggested_wait_time}s before retrying."
+    ) from exception
+```
+
+Each diagnostic includes an **issue template path** — a markdown file in `docs/` that provides context-specific troubleshooting. This turns opaque scraping failures into actionable guidance.
+
+---
+
+## Architecture Overview
+
+```
+MCP Client (Claude, Cursor, etc.)
+        │
+  ┌─────▼──────┐
+  │  FastMCP   │  ← MCP protocol (stdio or streamable-http)
+  │  Server    │
+  └─────┬──────┘
+        │
+  ┌─────▼──────────────┐
+  │ SequentialToolExec │  ← asyncio.Lock middleware
+  │ Middleware          │     serializes all navigations
+  └─────┬──────────────┘
+        │
+  ┌─────▼──────────────────┐
+  │    Tool Registry        │  ← 28+ tools across 7 categories
+  │ (user / posts / search  │
+  │  / insights / messaging │
+  │  / actions / gemini)    │
+  └─────┬──────────────────┘
+        │
+  ┌─────▼────────────────────────┐
+  │   Bootstrap & Auth State      │
+  │   Machine                     │  ← manages browser lifecycle
+  └─────┬────────────────────────┘
+        │
+  ┌─────▼──────────────────────┐
+  │  Browser Orchestrator       │
+  │  (Legacy / CDP / Docker)    │  ← three runtime modes
+  └─────┬──────────────────────┘
+        │
+  ┌─────▼──────────────┐
+  │  innerText          │
+  │  Extraction Engine  │  ← zero DOM selector dependence
+  └────────────────────┘
+```
+
+---
+
+## Tech Stack
+
+| Technology | Purpose |
+|------------|---------|
+| **Python 3.12+** | Type-safe async runtime with structural pattern matching |
+| **FastMCP 3.x** | MCP protocol server — enables stdio and streamable-http transports |
+| **Patchright** | Anti-detection Playwright fork — bypasses Instagram's webdriver checks |
+| **asyncio.Lock + Middleware** | Serialized tool execution — prevents concurrent navigation corruption |
+| **Gemini 2.0 Flash** | Multimodal reel analysis — video-to-text without local Whisper |
+| **Docker** | Headless deployment — portable auth via cookie archives |
+| **Ruff / Ty** | Strict linting (Ruff) and type checking (Ty, not mypy) |
+
+---
 
 ## Quick Start
 
-**1. Install**
-
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-**2. Configure your MCP client**
-
-Add to your client's MCP config (see [full configs below](#mcp-client-configuration)):
-
-```json
-{
-  "mcpServers": {
-    "instagram": {
-      "command": "uvx",
-      "args": ["instagram-scraper-mcp"]
-    }
-  }
-}
-```
-
-**3. First tool call**
-
-Restart your MCP client. On the first Instagram tool call, a login window opens if no session exists. Log in once, and cookies persist across restarts.
-
-## How It Works
-
-The server extracts your Instagram session cookies from your running browser (Chrome, Firefox, Edge, Brave, and 10+ others), saves them to `~/.instagram-mcp/profile/`, and launches an **isolated Patchright Chromium instance** with those cookies injected. All scraping happens in this separate browser. Your primary browser is never touched.
-
-```
-Your browser (logged into Instagram)
-  → cookies detected from SQLite cookie store
-  → saved to ~/.instagram-mcp/profile/
-  → injected into isolated Patchright Chromium
-  → all scraping runs in isolated instance
-```
-
-## Authentication
-
-| Scenario | What happens |
-|----------|-------------|
-| **First run** | Login browser window opens. Complete sign-in (including 2FA if needed). |
-| **Subsequent runs** | Cookies loaded from `~/.instagram-mcp/profile/` automatically. |
-| **Session expired** | Re-run `uvx instagram-scraper-mcp --login` to re-authenticate. |
-| **Clear session** | Run `uvx instagram-scraper-mcp --logout` to remove stored cookies. |
-
-> Instagram may request a login confirmation on your mobile app for new sessions. If you encounter a captcha, use `--login` to solve it manually in the opened browser.
-
-## MCP Client Configuration
-
-### Claude Desktop
-
-```json
-{
-  "mcpServers": {
-    "instagram": {
-      "command": "uvx",
-      "args": ["instagram-scraper-mcp"]
-    }
-  }
-}
-```
-
-### Cursor
-
-```json
-{
-  "mcpServers": {
-    "instagram": {
-      "command": "uvx",
-      "args": ["instagram-scraper-mcp"]
-    }
-  }
-}
-```
-
-### Windsurf
-
-```json
-{
-  "mcpServers": {
-    "instagram": {
-      "command": "uvx",
-      "args": ["instagram-scraper-mcp"]
-    }
-  }
-}
-```
-
-### Generic MCP Client
-
-```json
-{
-  "mcpServers": {
-    "instagram": {
-      "command": "uv",
-      "args": ["run", "-m", "instagram_mcp_server"]
-    }
-  }
-}
-```
-
-## Tools
-
-### Profile & Content (6 tools)
-
-| Tool | Description |
-|------|-------------|
-| `get_user_profile` | Get profile info. Optional sections: posts, reels, stories, highlights, followers, following |
-| `get_user_posts` | Get structured post data (ID, shortcode, URL, thumbnail, media type) |
-| `get_user_reels` | Get reels with IDs, URLs, thumbnails, and view counts |
-| `get_user_stories` | Get active stories with media URLs and expiry timestamps |
-| `get_user_highlights` | Get story highlights with titles, cover URLs, and highlight IDs |
-| `get_post_details` | Get detailed post/reel info including caption, engagement, audio info, and optional comments |
-
-### Search & Discovery (5 tools)
-
-| Tool | Description |
-|------|-------------|
-| `search_users` | Search for users by name or keywords |
-| `search_hashtags` | Search for hashtags by keywords |
-| `search_locations` | Search for Instagram locations |
-| `get_hashtag_posts` | Get posts for a given hashtag |
-| `get_location_posts` | Get posts tagged at a specific location |
-
-### Messaging & Actions (9 tools)
-
-| Tool | Description |
-|------|-------------|
-| `get_direct_inbox` | List recent DM conversations |
-| `get_dm_conversation` | Read a specific DM conversation |
-| `send_dm` | Send a direct message to a user |
-| `follow_user` | Follow a user (sends follow request for private accounts) |
-| `unfollow_user` | Unfollow a user |
-| `like_post` | Like a post or reel |
-| `unlike_post` | Unlike a post or reel |
-| `save_post` | Save a post or reel to a collection |
-| `comment_on_post` | Post a comment on a post or reel |
-
-### Business/Creator Insights (4 tools)
-
-> All require a Business or Creator account (accessed via Professional Dashboard).
-
-| Tool | Description |
-|------|-------------|
-| `get_business_insights` | Get reach, impressions, and engagement metrics |
-| `get_audience_insights` | Get audience demographics |
-| `get_content_insights` | Get content performance data |
-| `get_activity_insights` | Get profile activity metrics |
-
-### Transcription (2 tools)
-
-> Requires the `caption` CLI tool (Whisper-based). See [docs/TRANSCRIPTION.md](docs/TRANSCRIPTION.md).
-
-| Tool | Description |
-|------|-------------|
-| `transcribe_user_reels` | Download and transcribe multiple reels to SRT subtitles |
-| `transcribe_reel` | Transcribe a single reel by URL to SRT |
-
-### AI Analysis (2 tools)
-
-> Requires `GEMINI_API_KEY` environment variable. Uses Google Gemini 2.0 Flash. See [docs/GEMINI_ANALYSIS.md](docs/GEMINI_ANALYSIS.md).
-
-| Tool | Description |
-|------|-------------|
-| `analyze_reel_with_gemini` | Multimodal reel analysis (summary, transcript, topics, quotes) |
-| `bulk_analyze_reels_with_gemini` | Analyze multiple reels with Gemini AI |
-
-## Optional Features
-
-### Gemini AI Analysis
-
-Set your API key before starting the server:
-
-```bash
-export GEMINI_API_KEY="your-api-key"
+# Install via uvx (no local install needed)
 uvx instagram-scraper-mcp
 ```
 
-### Local Transcription
+On first tool call, a login window opens. Log in once; cookies persist across restarts.
 
-Install the [`caption`](https://github.com/oliverguhr/caption) CLI tool for local Whisper-based transcription. Alternatively, use `analyze_reel_with_gemini` for AI transcription without local dependencies.
+See [MCP Client Configuration](#mcp-client-configuration) for IDE setup.
 
-### CDP Mode (Opt-in)
+### Advanced Configurations
 
-Connect directly to a running Brave browser via Chrome DevTools Protocol instead of using cookie import:
+| Mode | Command |
+|------|---------|
+| **CDP (Brave)** | `uvx instagram-scraper-mcp --cdp` |
+| **Docker** | See [docs/docker-hub.md](docs/docker-hub.md) |
+| **Gemini Analysis** | `GEMINI_API_KEY=xxx uvx instagram-scraper-mcp` |
+| **Debug Mode** | `uvx instagram-scraper-mcp --log-level DEBUG --no-headless` |
 
-```bash
-# Start Brave with remote debugging
-brave --remote-debugging-port=9222
+---
 
-# Connect via CLI flag
-uvx instagram-scraper-mcp --cdp
+## Tool Suite
 
-# Or via environment variable
-export INSTAGRAM_USE_CDP_MODE=1
-uvx instagram-scraper-mcp
-```
+| Category | Tools | Capabilities |
+|----------|-------|-------------|
+| **Profile & Content** | `get_user_profile`, `get_user_posts`, `get_user_reels`, `get_user_stories`, `get_user_highlights`, `get_post_details` | Posts, reels, stories, highlights, followers/following lists |
+| **Search & Discovery** | `search_users`, `search_hashtags`, `search_locations`, `get_hashtag_posts`, `get_location_posts` | User, hashtag, and location search |
+| **Messaging & Actions** | `get_direct_inbox`, `get_dm_conversation`, `send_dm`, `follow_user`, `unfollow_user`, `like_post`, `unlike_post`, `save_post`, `comment_on_post` | Full DM and engagement suite |
+| **Business Insights** | `get_business_insights`, `get_audience_insights`, `get_content_insights`, `get_activity_insights` | Reach, impressions, demographics (Business/Creator accounts only) |
+| **AI Analysis** | `analyze_reel_with_gemini`, `bulk_analyze_reels_with_gemini` | Multimodal reel transcription and analysis via Gemini 2.0 Flash |
+| **Transcription** | `transcribe_user_reels`, `transcribe_reel` | Local Whisper-based SRT subtitle generation |
 
-See [docs/CDP_MODE.md](docs/CDP_MODE.md) for details.
+---
 
-## Docker Setup
+## Potentialities
 
-Docker runs headless, so create a browser profile on your host first and mount it.
+- **Headless auth recovery**: Currently Docker runtime requires host-side `--login`. A self-service web portal for one-time auth token generation would eliminate this friction.
+- **Multi-account session management**: The sequential middleware prevents intra-session conflicts, but switching between Instagram accounts requires a separate profile. Native account switching would enable parallel multi-account extraction.
+- **Webhook-based rate limit mitigation**: Rate limits are currently synchronous (wait N seconds). An async queue with webhook callbacks would allow batch processing without tool timeouts.
+- **GraphQL API fallback**: Instagram's internal GraphQL API occasionally surfaces in responses. A hybrid strategy (extraction + API probes) could reduce page navigations for known-stable endpoints.
 
-**1. Create profile (one-time)**
-
-```bash
-uvx instagram-scraper-mcp --login
-```
-
-**2. Configure MCP client**
-
-```json
-{
-  "mcpServers": {
-    "instagram": {
-      "command": "docker",
-      "args": [
-        "run", "--rm", "-i",
-        "-v", "${HOME}/.instagram-mcp:/home/pwuser/.instagram-mcp",
-        "stickerdaniel/instagram-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-See [docs/docker-hub.md](docs/docker-hub.md) for full Docker documentation including HTTP mode and troubleshooting.
-
-## Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| **No cookies found** | Ensure you are logged into Instagram in a supported browser. Run `uvx instagram-scraper-mcp --login` to open the login flow. |
-| **Session expired** | Re-run `uvx instagram-scraper-mcp --login` to create a fresh session. |
-| **Captcha challenge** | Use `--login` to solve it manually in the opened browser. |
-| **Page timeout** | Increase timeout: `--timeout 10000` (or higher for slow connections). |
-| **Chrome not found** | Set custom path: `--chrome-path /path/to/chrome` or `CHROME_PATH` env var. |
-| **Multiple Instagram sessions** | Instagram may conflict with concurrent sessions. Log out of other active sessions. |
-| **Browser profile location** | Profile stored at `~/.instagram-mcp/profile/`. Use `--logout` to clear. |
-
-For debug output, add `--log-level DEBUG`. Use `--no-headless` to watch browser actions.
-
-## Development & Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for architecture guidelines, development commands, and the contribution workflow. Please [open an issue](https://github.com/stickerdaniel/instagram-mcp-server/issues) before submitting a PR.
+---
 
 ## License & Acknowledgements
 
